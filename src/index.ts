@@ -24,6 +24,13 @@ import { WRITE_APEX, handleWriteApex, WriteApexArgs } from "./tools/writeApex.js
 import { READ_APEX_TRIGGER, handleReadApexTrigger, ReadApexTriggerArgs } from "./tools/readApexTrigger.js";
 import { WRITE_APEX_TRIGGER, handleWriteApexTrigger, WriteApexTriggerArgs } from "./tools/writeApexTrigger.js";
 import { EXECUTE_ANONYMOUS, handleExecuteAnonymous, ExecuteAnonymousArgs } from "./tools/executeAnonymous.js";
+import {
+  ADMIN_WRITE_TOOLS,
+  adminWritesEnabled,
+  assertAdminWriteAllowed,
+  assertDmlAllowed,
+  assertExpectedOrg,
+} from "./utils/writeGuard.js";
 import { MANAGE_DEBUG_LOGS, handleManageDebugLogs, ManageDebugLogsArgs } from "./tools/manageDebugLogs.js";
 
 // Load environment variables (using dotenv 16.x which has no stdout tips)
@@ -48,25 +55,35 @@ const server = new Server(
 );
 
 // Tool handlers
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    SEARCH_OBJECTS, 
-    DESCRIBE_OBJECT, 
-    QUERY_RECORDS, 
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  const tools = [
+    SEARCH_OBJECTS,
+    DESCRIBE_OBJECT,
+    QUERY_RECORDS,
     AGGREGATE_QUERY,
     DML_RECORDS,
-    MANAGE_OBJECT,
-    MANAGE_FIELD,
-    MANAGE_FIELD_PERMISSIONS,
     SEARCH_ALL,
     READ_APEX,
-    WRITE_APEX,
     READ_APEX_TRIGGER,
-    WRITE_APEX_TRIGGER,
-    EXECUTE_ANONYMOUS,
-    MANAGE_DEBUG_LOGS
-  ],
-}));
+    MANAGE_DEBUG_LOGS,
+  ];
+
+  // Schema and Apex tools bypass the SFDC_ALLOWED_WRITES object allowlist, so they
+  // are not advertised unless SFDC_ALLOW_ADMIN_WRITES=true. The dispatch handler
+  // refuses them regardless of what is listed here.
+  if (adminWritesEnabled()) {
+    tools.push(
+      MANAGE_OBJECT,
+      MANAGE_FIELD,
+      MANAGE_FIELD_PERMISSIONS,
+      WRITE_APEX,
+      WRITE_APEX_TRIGGER,
+      EXECUTE_ANONYMOUS,
+    );
+  }
+
+  return { tools };
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
@@ -74,6 +91,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (!args) throw new Error('Arguments are required');
 
     const conn = await createSalesforceConnection();
+
+    // Write guard. Fails closed: see src/utils/writeGuard.ts.
+    // Runs before dispatch so no write tool can reach jsforce ungated.
+    if (name === "salesforce_dml_records") {
+      const guardArgs = args as Record<string, unknown>;
+      assertDmlAllowed(String(guardArgs.objectName ?? ''), String(guardArgs.operation ?? ''));
+      await assertExpectedOrg(conn);
+    } else if (ADMIN_WRITE_TOOLS.includes(name)) {
+      assertAdminWriteAllowed(name);
+      await assertExpectedOrg(conn);
+    }
 
     switch (name) {
       case "salesforce_search_objects": {
